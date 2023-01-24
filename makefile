@@ -15,23 +15,54 @@ ifeq ($(shell echo "check_quotes"),"check_quotes")
 	MKDIR = mkdir $(subst /,\,$(1)) > nul 2>&1 || (exit 0)
 endif
 
-all: default test
+
+CXXFLAGS += $(shell pkg-config --cflags sdl2)
+SDL2LIB += $(shell pkg-config --libs sdl2)
+
+all: default test step0analysis step1edit step2synthesis
 
 ###############################################################################################################
 ### Tests
 ###############################################################################################################
 test: $(OUT_DIR)/test $(OUT_DIR)/ctest
 
+step0analysis: $(OUT_DIR)/step0analysis
+step1edit: $(OUT_DIR)/step1edit
+step2synthesis: $(OUT_DIR)/step2synthesis
+
 test_OBJS=$(OUT_DIR)/objs/tools/audioio.o $(OUT_DIR)/objs/test/test.o
 $(OUT_DIR)/test: $(OUT_DIR)/libworld.a $(test_OBJS)
 	$(LINK) $(CXXFLAGS) -o $(OUT_DIR)/test $(test_OBJS) $(OUT_DIR)/libworld.a -lm
+
+step0analysis_OBJS=$(OUT_DIR)/objs/tools/audioio.o $(OUT_DIR)/objs/test/step0analysis.o
+$(OUT_DIR)/step0analysis: $(OUT_DIR)/libworld.a $(step0analysis_OBJS)
+	$(LINK) $(CXXFLAGS) -o $(OUT_DIR)/step0analysis $(step0analysis_OBJS) $(OUT_DIR)/libworld.a -lm
+
+step1edit_OBJS=$(OUT_DIR)/objs/test/step1edit.o
+$(OUT_DIR)/step1edit: $(step1edit_OBJS)
+	$(LINK) $(CXXFLAGS) -o $(OUT_DIR)/step1edit $(step1edit_OBJS) $(SDL2LIB) -lm
+
+step2synthesis_OBJS=$(OUT_DIR)/objs/tools/audioio.o $(OUT_DIR)/objs/test/step2synthesis.o
+$(OUT_DIR)/step2synthesis: $(OUT_DIR)/libworld.a $(step2synthesis_OBJS)
+	$(LINK) $(CXXFLAGS) -o $(OUT_DIR)/step2synthesis $(step2synthesis_OBJS) $(OUT_DIR)/libworld.a -lm
+
 
 ctest_OBJS=$(OUT_DIR)/objs/tools/audioio.o $(OUT_DIR)/objs/test/ctest.o
 $(OUT_DIR)/ctest: $(OUT_DIR)/libworld.a $(ctest_OBJS)
 	$(LINK) $(CXXFLAGS) -o $(OUT_DIR)/ctest $(ctest_OBJS) $(OUT_DIR)/libworld.a -lm
 
+
+
+
 $(OUT_DIR)/objs/test/test.o : tools/audioio.h src/world/d4c.h src/world/dio.h src/world/harvest.h src/world/matlabfunctions.h src/world/cheaptrick.h src/world/stonemask.h src/world/synthesis.h src/world/common.h src/world/fft.h src/world/macrodefinitions.h
+
 $(OUT_DIR)/objs/test/ctest.o : tools/audioio.h src/world/d4c.h src/world/dio.h src/world/harvest.h src/world/matlabfunctions.h src/world/cheaptrick.h src/world/stonemask.h src/world/synthesis.h src/world/common.h src/world/fft.h src/world/macrodefinitions.h
+
+$(OUT_DIR)/objs/test/step0analysis.o : tools/audioio.h src/world/d4c.h src/world/dio.h src/world/harvest.h src/world/matlabfunctions.h src/world/cheaptrick.h src/world/stonemask.h src/world/synthesis.h src/world/common.h src/world/fft.h src/world/macrodefinitions.h test/analysis.h
+
+$(OUT_DIR)/objs/test/step1edit.o : test/analysis.h
+
+$(OUT_DIR)/objs/test/step2synthesis.o : tools/audioio.h src/world/d4c.h src/world/dio.h src/world/harvest.h src/world/matlabfunctions.h src/world/cheaptrick.h src/world/stonemask.h src/world/synthesis.h src/world/common.h src/world/fft.h src/world/macrodefinitions.h test/analysis.h
 
 ###############################################################################################################
 ### Library
