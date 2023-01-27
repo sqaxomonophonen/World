@@ -94,11 +94,51 @@ struct analysis {
 	int sample_rate;
 	int n_analysis_frames;
 
-	double** other_spectrogram; //  n = n_analysis_frames
-	double*  f0;                //  n = n_channels*n_analysis_frames (stacked)
-	double** spectrogram;       //  n = n_channels*n_analysis_frames (stacked)
-	double** aperiodicity;      //  n = n_channels*n_analysis_frames (stacked)
+	double f0_min;
+	double f0_max;
+
+	double**  other_spectrogram; // [frame_index][fftbin]
+	double**  f0;                // [channel][frame_index]
+	double*** spectrogram;       // [channel][frame_index][fftbin]
+	double*** aperiodicity;      // [channel][frame_index][fftbin]
 };
+
+static inline double* analysis_get_other_spectrogram(struct analysis* a, int frame_index)
+{
+	if (0 <= frame_index && frame_index < a->n_analysis_frames) {
+		return a->other_spectrogram[frame_index];
+	} else {
+		return NULL;
+	}
+}
+
+static inline double analysis_get_f0(struct analysis* a, int channel, int frame_index)
+{
+	assert(0 <= channel && channel < a->n_channels);
+	if (0 <= frame_index && frame_index < a->n_analysis_frames) {
+		return a->f0[channel][frame_index];
+	} else {
+		return 0.0;
+	}
+}
+
+static inline double* analysis_get_spectrogram(struct analysis* a, int channel, int frame_index)
+{
+	if (0 <= frame_index && frame_index < a->n_analysis_frames) {
+		return a->spectrogram[channel][frame_index];
+	} else {
+		return NULL;
+	}
+}
+
+static inline double* analysis_get_aperiodicity(struct analysis* a, int channel, int frame_index)
+{
+	if (0 <= frame_index && frame_index < a->n_analysis_frames) {
+		return a->aperiodicity[channel][frame_index];
+	} else {
+		return NULL;
+	}
+}
 
 static int analysis_open(struct analysis* a, const char* path)
 {
@@ -161,30 +201,56 @@ static int analysis_open(struct analysis* a, const char* path)
 	}
 
 	const int fft_storage_length = calc_fft_storage_length_from_fft_length(get_fft_length_from_sample_rate(sample_rate));
-	const int n_total_frames = n_channels*n_analysis_frames;
+
+	double* fp = p;
 
 	a->other_spectrogram = calloc(n_analysis_frames, sizeof(*a->other_spectrogram));
 	for (int i = 0; i < n_analysis_frames; i++) {
-		a->other_spectrogram[i] = p;
-		p += fft_storage_length * sizeof(**a->other_spectrogram);
+		a->other_spectrogram[i] = fp;
+		fp += fft_storage_length;
 	}
 
-	a->f0 = p;
-	p += n_total_frames * sizeof(*a->f0);
+	a->f0 = calloc(n_channels, sizeof(*a->f0));
+	a->spectrogram = calloc(n_channels, sizeof(*a->spectrogram));
+	a->aperiodicity = calloc(n_channels, sizeof(*a->aperiodicity));
 
-	a->spectrogram = calloc(n_total_frames, sizeof(*a->spectrogram));
-	for (int i = 0; i < n_total_frames; i++) {
-		a->spectrogram[i] = p;
-		p += fft_storage_length * sizeof(**a->other_spectrogram);
+	for (int ch = 0; ch < n_channels; ch++) {
+		a->f0[ch] = fp;
+		fp += n_analysis_frames;
+
+		a->spectrogram[ch] = calloc(n_analysis_frames, sizeof(**a->spectrogram));
+		a->aperiodicity[ch] = calloc(n_analysis_frames, sizeof(**a->aperiodicity));
+
+		for (int i = 0; i < n_analysis_frames; i++) {
+			a->spectrogram[ch][i] = fp;
+			fp += fft_storage_length;
+
+			a->aperiodicity[ch][i] = fp;
+			fp += fft_storage_length;
+		}
 	}
 
-	a->aperiodicity = calloc(n_total_frames, sizeof(*a->aperiodicity));
-	for (int i = 0; i < n_total_frames; i++) {
-		a->aperiodicity[i] = p;
-		p += fft_storage_length * sizeof(**a->other_spectrogram);
+	{ // calculate f0 range
+		int first = 1;
+		double f0_min = 0.0;
+		double f0_max = 0.0;
+		for (int ch = 0; ch < n_channels; ch++) {
+			for (int frame_index = 0; frame_index < n_analysis_frames; frame_index++) {
+				double f0 = analysis_get_f0(a, ch, frame_index);
+				if (f0 > 0.0) {
+					if (first) {
+						f0_min = f0_max = f0;
+						first = 0;
+					} else {
+						if (f0 < f0_min) f0_min = f0;
+						if (f0 > f0_max) f0_max = f0;
+					}
+				}
+			}
+		}
+		a->f0_min = f0_min;
+		a->f0_max = f0_max;
 	}
-
-	assert((p - a->data) == sz);
 
 	return 1;
 }
@@ -285,20 +351,82 @@ enum ui_row {
 	N_UI_ROWS
 };
 
+struct ui_nav {
+	int64_t x0;
+	// frame_index = x0 * slope + constant
+	int64_t x2f_slope_48_16_fixed;
+	int64_t x2f_constant_48_16_fixed;
+};
+
+static inline int ui_nav_x2f(struct ui_nav* nav, int x)
+{
+	return ((nav->x0 + (uint64_t)x)* nav->x2f_slope_48_16_fixed + nav->x2f_constant_48_16_fixed) >> 16;
+}
+
+static inline void ui_nav_apply_pan(struct ui_nav* nav, int dx)
+{
+	nav->x0 -= dx;
+}
+
+static inline double fixed_48_16_to_double(int64_t v)
+{
+	return (double)v / (double)(1<<16);
+}
+
+static inline int64_t double_to_fixed_48_16(double v)
+{
+	return (int64_t)(v * (double)(1<<16));
+}
+
+static inline void ui_nav_apply_d_zoom(struct ui_nav* nav, int mx, double d_zoom) // fun fact: my brain wants to type "z_doom" instead
+{
+	double slope = fixed_48_16_to_double(nav->x2f_slope_48_16_fixed);
+	double constant = fixed_48_16_to_double(nav->x2f_constant_48_16_fixed);
+
+	const double old_slope = slope;
+	const double old_constant = constant;
+	const double zoom_speed = 1.05;
+
+	slope *= pow(zoom_speed, -d_zoom);
+
+	// must choose new 'constant' so that the frame index under the mouse
+	// (mx) remains the same.
+	//   frame_index = x * slope + constant
+	//   x under mouse is x0+mx
+	//   eq: x*old_slope + old_constant = x*slope + constant
+	//       constant = (x*old_slope + old_constant) - (x*slope)
+	double x = (double)(nav->x0 + mx);
+	constant = (x*old_slope + old_constant) - (x*slope);
+
+	nav->x2f_slope_48_16_fixed = double_to_fixed_48_16(slope);
+	nav->x2f_constant_48_16_fixed = double_to_fixed_48_16(constant);
+
+	// prevent zero/negative slope
+	if (nav->x2f_slope_48_16_fixed <= 1) nav->x2f_slope_48_16_fixed = 1;
+}
+
 struct ui {
+	#if 0
 	int last_btn;
 	int btn;
 	int mx;
 	int my;
 	int last_mx;
 	int last_my;
+	#endif
+
 	int show[N_UI_ROWS];
+	int last_mx;
+
+	struct ui_nav nav;
 };
 
 static void ui_init(struct ui* ui)
 {
 	memset(ui, 0, sizeof *ui);
 	for (int i = 0; i < N_UI_ROWS; i++) ui->show[i] = 1;
+	ui->nav.x2f_slope_48_16_fixed = 1<<16;
+	ui->nav.x2f_constant_48_16_fixed = 0;
 }
 
 struct ui_ctx {
@@ -308,7 +436,23 @@ struct ui_ctx {
 	int w;
 	int h;
 	uint32_t* pixels;
+	struct ui_nav* nav;
+	int fft_storage_length;
 };
+
+static inline int ux_x2f(struct ui_ctx* ctx, int x)
+{
+	return ui_nav_x2f(ctx->nav, x);
+}
+
+static inline int ux_map_y_to_fft_bin(struct ui_ctx* ctx, int y)
+{
+	const int n = ctx->fft_storage_length;
+	int index = round((1.0 - (double)y / (double)ctx->h) * (double)n);
+	if (index < 0) index = 0;
+	if (index >= n) index = n-1;
+	return index;
+}
 
 static void ui_ctx_prep(struct ui_ctx* ctx, uint32_t* pixels, int y0, int y1)
 {
@@ -329,38 +473,170 @@ static inline void ux_plot(struct ui_ctx* ctx, int x, int y, uint32_t pixel)
 	ctx->pixels[x + y*ctx->w] = pixel;
 }
 
+static inline uint32_t rgba_add(uint32_t a, uint32_t b)
+{
+	uint32_t r = 0;
+	for (int shift = 0; shift < 32; shift+=8) {
+		int va = (a >> shift) & 0xff;
+		int vb = (b >> shift) & 0xff;
+		int m = va+vb;
+		if (m > 0xff) m = 0xff;
+		r += m << shift;
+	}
+	return r;
+}
+
+static inline void ux_plot_additive(struct ui_ctx* ctx, int x, int y, uint32_t pixel)
+{
+	uint32_t* p = &ctx->pixels[x + y*ctx->w];
+	*p = rgba_add(*p, pixel);
+}
+
 static void ui_handle_BROKEN(struct ui_ctx* ctx)
 {
-	ux_fill(ctx, 0);
+	ux_fill(ctx, 0x220000ff);
 }
 
 static void ui_handle_DRY(struct ui_ctx* ctx)
 {
-	ux_fill(ctx, 0);
+	ux_fill(ctx, 0x222222ff);
+}
+
+static inline uint32_t f64rgbenc(double r, double g, double b)
+{
+	if (r < 0.0) r = 0.0;
+	if (r > 1.0) r = 1.0;
+	if (g < 0.0) g = 0.0;
+	if (g > 1.0) g = 1.0;
+	if (b < 0.0) b = 0.0;
+	if (b > 1.0) b = 1.0;
+	r *= 255.0;
+	g *= 255.0;
+	b *= 255.0;
+	return
+		  ((uint32_t)round(r) << 24)
+		+ ((uint32_t)round(g) << 16)
+		+ ((uint32_t)round(b) << 8)
+		+ 0xff; // alpha
 }
 
 static void ui_handle_OTHER_SPECTROGRAM(struct ui_ctx* ctx)
 {
-	ux_fill(ctx, 0);
+	struct analysis* a = ctx->analysis;
+	const int n_analysis_frames = a->n_analysis_frames;
+	int last_frame_index = -1;
+	const int w = ctx->w;
+	const int h = ctx->h;
+	uint32_t cached_column[1<<14];
+	for (int x = 0; x < w; x++) {
+		int frame_index = ux_x2f(ctx, x);
+		if (!(0 <= frame_index && frame_index < n_analysis_frames)) continue;
+
+		if (frame_index > last_frame_index) {
+			double* xs = analysis_get_other_spectrogram(a, frame_index);
+			for (int y = 0; y < h; y++) {
+				int bi = ux_map_y_to_fft_bin(ctx, y);
+				double v = log(xs[bi] + 1.0);
+				double r = v;
+				double g = v*v;
+				double b = v*v*v;
+				cached_column[y] = f64rgbenc(r,g,b);
+			}
+			last_frame_index = frame_index;
+		}
+
+		for (int y = 0; y < h; y++) ux_plot(ctx, x, y, cached_column[y]);
+	}
 }
 
 static void ui_handle_F0(struct ui_ctx* ctx)
 {
-	ux_fill(ctx, 0x222200ff);
+	ux_fill(ctx, 0x111100ff);
+	struct analysis* a = ctx->analysis;
+	const int n_analysis_frames = a->n_analysis_frames;
 	for (int x = 0; x < ctx->w; x++) {
-		const int y = x%ctx->h; // XXX TODO
-		ux_plot(ctx, x, y, 0xffff00ff);
+		int frame_index = ux_x2f(ctx, x);
+		if (0 <= frame_index && frame_index < n_analysis_frames) {
+			for (int ch = 0; ch < a->n_channels; ch++) {
+				double f0 = analysis_get_f0(a, ch, frame_index);
+				if (f0 > 0) {
+					double t = (f0 - a->f0_max) / (a->f0_min - a->f0_max);
+					double y = t * ctx->h;
+					ux_plot_additive(ctx, x, y, 0xaa9944ff);
+				} else {
+					for (int y = 0; y < ctx->h; y++) {
+						ux_plot_additive(ctx, x, y, 0x110022ff);
+					}
+				}
+			}
+		}
 	}
 }
 
 static void ui_handle_SPECTROGRAM(struct ui_ctx* ctx)
 {
-	ux_fill(ctx, 0);
+	struct analysis* a = ctx->analysis;
+	const int n_analysis_frames = a->n_analysis_frames;
+	int last_frame_index = -1;
+	const int w = ctx->w;
+	const int h = ctx->h;
+	const int n_channels = a->n_channels;
+	uint32_t cached_column[1<<14];
+	for (int x = 0; x < w; x++) {
+		int frame_index = ux_x2f(ctx, x);
+		if (!(0 <= frame_index && frame_index < n_analysis_frames)) continue;
+
+		if (frame_index > last_frame_index) {
+			for (int y = 0; y < h; y++) {
+				int bi = ux_map_y_to_fft_bin(ctx, y);
+				double m = 0.0;
+				for (int channel = 0; channel < n_channels; channel++) {
+					m += analysis_get_spectrogram(a, channel, frame_index)[bi];
+				}
+				double v = log(m + 1.0) * 10.0;
+				double r = v*v;
+				double g = v;
+				double b = v*v*v;
+				cached_column[y] = f64rgbenc(r,g,b);
+			}
+			last_frame_index = frame_index;
+		}
+
+		for (int y = 0; y < h; y++) ux_plot(ctx, x, y, cached_column[y]);
+	}
 }
 
 static void ui_handle_APERIODICITY(struct ui_ctx* ctx)
 {
-	ux_fill(ctx, 0);
+	struct analysis* a = ctx->analysis;
+	const int n_analysis_frames = a->n_analysis_frames;
+	int last_frame_index = -1;
+	const int w = ctx->w;
+	const int h = ctx->h;
+	const int n_channels = a->n_channels;
+	uint32_t cached_column[1<<14];
+	for (int x = 0; x < w; x++) {
+		int frame_index = ux_x2f(ctx, x);
+		if (!(0 <= frame_index && frame_index < n_analysis_frames)) continue;
+
+		if (frame_index > last_frame_index) {
+			for (int y = 0; y < h; y++) {
+				int bi = ux_map_y_to_fft_bin(ctx, y);
+				double m = 0.0;
+				for (int channel = 0; channel < n_channels; channel++) {
+					m += analysis_get_aperiodicity(a, channel, frame_index)[bi];
+				}
+				double v = log(m + 1.0) * 15.0;
+				double r = v*v;
+				double g = v*v*v;
+				double b = v;
+				cached_column[y] = f64rgbenc(r,g,b);
+			}
+			last_frame_index = frame_index;
+		}
+
+		for (int y = 0; y < h; y++) ux_plot(ctx, x, y, cached_column[y]);
+	}
 }
 
 static void ui_handle(struct ui* ui, int width, int height, uint32_t* pixels, struct analysis* analysis, struct edit* edit)
@@ -384,6 +660,8 @@ static void ui_handle(struct ui* ui, int width, int height, uint32_t* pixels, st
 			.analysis = analysis,
 			.edit = edit,
 			.w = width,
+			.nav = &ui->nav,
+			.fft_storage_length = calc_fft_storage_length_from_fft_length(get_fft_length_from_sample_rate(analysis->sample_rate)),
 		};
 		#define ROW(NAME,WEIGHT) \
 			if (ui->show[i]) { \
@@ -399,10 +677,20 @@ static void ui_handle(struct ui* ui, int width, int height, uint32_t* pixels, st
 		#undef UI_ROWS
 	}
 
+	#if 0
 	ui->last_btn = ui->btn;
 	ui->last_mx = ui->mx;
 	ui->last_my = ui->my;
+	#endif
 }
+
+static void ui_update_navigation(struct ui* ui, int is_panning, int mx, float d_zoom)
+{
+	if (is_panning) ui_nav_apply_pan(&ui->nav, mx - ui->last_mx);
+	if (d_zoom != 0.0) ui_nav_apply_d_zoom(&ui->nav, mx, d_zoom);
+	ui->last_mx = mx;
+}
+
 
 int main(int argc, char** argv)
 {
@@ -479,8 +767,6 @@ int main(int argc, char** argv)
 			p += sizeof h;
 		}
 
-		//const int n_total_frames = n_channels * n_analysis_frames;
-
 		const int fft_length = get_fft_length_from_sample_rate(sample_rate);
 		const int fft_storage_length = calc_fft_storage_length_from_fft_length(fft_length);
 
@@ -503,7 +789,7 @@ int main(int argc, char** argv)
 			for (int i0 = 0; i0 < n_analysis_frames; i0++) {
 				for (int i1 = 0; i1 < fft_length; i1++) {
 					double t = ((double)i1 * 2.0) / (double)(fft_length) - 1.0;
-					double w = kaiser_bessel(kb_alpha, t);
+					double w = kaiser_bessel(kb_alpha, t); // could put this expensive func into a LUT...
 					int xi = (int)round((double)(i0*sample_rate)*ANALYSIS_PERIOD_SECONDS) + i1;
 
 					double x = 0.0;
@@ -607,13 +893,12 @@ int main(int argc, char** argv)
 
 	SDL_Texture* canvas_texture = NULL;
 	int canvas_width = -1;
-	int canvas_height;
+	int canvas_height = -1;
 	uint32_t* canvas_pixels = NULL;
 	size_t canvas_sz;
 
 	int exiting = 0;
 	int is_panning = 0;
-	int pan_anchor_x;
 
 	int mx;
 	int my;
@@ -623,6 +908,8 @@ int main(int argc, char** argv)
 	ui_init(&ui);
 
 	while (!exiting) {
+		float d_zoom = 0.0f;
+
 		SDL_Event e;
 		while (SDL_PollEvent(&e)) {
 			switch (e.type) {
@@ -650,32 +937,25 @@ int main(int argc, char** argv)
 			case SDL_MOUSEMOTION: {
 				mx = e.motion.x;
 				my = e.motion.y;
-
-				if (is_panning) {
-					int dx = pan_anchor_x - mx;
-					// TODO
-				}
 			} break;
 
 			case SDL_MOUSEBUTTONDOWN:
 			case SDL_MOUSEBUTTONUP: {
 				const int is_down = (e.type == SDL_MOUSEBUTTONDOWN);
 				const int button = e.button.button;
-				if (button == 1) {
-					ui.btn = is_down;
-				} else if (button == 3) {
-					if (is_down) pan_anchor_x = e.button.x;
+				if (button == 3) {
 					is_panning = is_down;
 				}
 			} break;
 
 			case SDL_MOUSEWHEEL: {
-				float dzoom = e.wheel.preciseY;
-				// TODO
+				d_zoom += e.wheel.preciseY;
 			} break;
 
 			}
 		}
+
+		ui_update_navigation(&ui, is_panning, mx, d_zoom);
 
 		SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
 		SDL_RenderClear(renderer);
