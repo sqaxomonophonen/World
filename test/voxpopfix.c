@@ -24,6 +24,9 @@
 #define ANALYSIS_PERIOD_SECONDS   (5e-3)
 #define ANALYSIS_F0_FLOOR         (71.0)
 
+#define OTHER_SPECTROGRAM_FFT_LENGTH (1<<12) // problem most noticable here (lower=too low resolution; higher=too blurry)
+#define OTHER_SPECTROGRAM_FFT_STORAGE_LENGTH (OTHER_SPECTROGRAM_FFT_LENGTH/2+1)
+
 static inline double bessel_I0(double x)
 {
 	double d = 0.0;
@@ -82,7 +85,7 @@ static size_t calc_analysis_file_size(int n_channels, int n_analysis_frames, int
 {
 	int fft_storage_length = calc_fft_storage_length_from_fft_length(get_fft_length_from_sample_rate(sample_rate));
 	size_t header_size = sizeof(struct analysis_header);
-	size_t body_size = n_analysis_frames*fft_storage_length*sizeof(double) + n_channels * n_analysis_frames * ((1 + 2*fft_storage_length)*sizeof(double));
+	size_t body_size = n_analysis_frames*OTHER_SPECTROGRAM_FFT_STORAGE_LENGTH*sizeof(double) + n_channels * n_analysis_frames * ((1 + 2*fft_storage_length)*sizeof(double));
 	return header_size + body_size;
 }
 
@@ -200,15 +203,15 @@ static int analysis_open(struct analysis* a, const char* path)
 		exit(EXIT_FAILURE);
 	}
 
-	const int fft_storage_length = calc_fft_storage_length_from_fft_length(get_fft_length_from_sample_rate(sample_rate));
-
 	double* fp = p;
 
 	a->other_spectrogram = calloc(n_analysis_frames, sizeof(*a->other_spectrogram));
 	for (int i = 0; i < n_analysis_frames; i++) {
 		a->other_spectrogram[i] = fp;
-		fp += fft_storage_length;
+		fp += OTHER_SPECTROGRAM_FFT_STORAGE_LENGTH;
 	}
+
+	const int fft_storage_length = calc_fft_storage_length_from_fft_length(get_fft_length_from_sample_rate(sample_rate));
 
 	a->f0 = calloc(n_channels, sizeof(*a->f0));
 	a->spectrogram = calloc(n_channels, sizeof(*a->spectrogram));
@@ -224,11 +227,15 @@ static int analysis_open(struct analysis* a, const char* path)
 		for (int i = 0; i < n_analysis_frames; i++) {
 			a->spectrogram[ch][i] = fp;
 			fp += fft_storage_length;
+		}
 
+		for (int i = 0; i < n_analysis_frames; i++) {
 			a->aperiodicity[ch][i] = fp;
 			fp += fft_storage_length;
 		}
 	}
+
+	assert(((void*)fp - a->data) == sz);
 
 	{ // calculate f0 range
 		int first = 1;
@@ -339,7 +346,7 @@ static void edit_close(struct edit* edit)
 #define UI_ROWS \
 	ROW(BROKEN,             2.0) \
 	ROW(DRY,                1.0) \
-	ROW(OTHER_SPECTROGRAM,  8.0) \
+	ROW(OTHER_SPECTROGRAM, 20.0) \
 	ROW(F0,                 6.0) \
 	ROW(SPECTROGRAM,        4.0) \
 	ROW(APERIODICITY,       4.0)
@@ -445,14 +452,14 @@ static inline int ux_x2f(struct ui_ctx* ctx, int x)
 	return ui_nav_x2f(ctx->nav, x);
 }
 
-static inline int ux_map_y_to_fft_bin(struct ui_ctx* ctx, int y)
+static inline int binmap(int y, int h, int n, double scale)
 {
-	const int n = ctx->fft_storage_length;
-	int index = round((1.0 - (double)y / (double)ctx->h) * (double)n);
+	int index = round((1.0 - (double)y / (double)h) * (double)n * scale);
 	if (index < 0) index = 0;
 	if (index >= n) index = n-1;
 	return index;
 }
+
 
 static void ui_ctx_prep(struct ui_ctx* ctx, uint32_t* pixels, int y0, int y1)
 {
@@ -535,8 +542,8 @@ static void ui_handle_OTHER_SPECTROGRAM(struct ui_ctx* ctx)
 		if (frame_index > last_frame_index) {
 			double* xs = analysis_get_other_spectrogram(a, frame_index);
 			for (int y = 0; y < h; y++) {
-				int bi = ux_map_y_to_fft_bin(ctx, y);
-				double v = log(xs[bi] + 1.0);
+				int bi = binmap(y, ctx->h, OTHER_SPECTROGRAM_FFT_STORAGE_LENGTH, 0.15);
+				double v = log(xs[bi] + 1.0) * 0.5;
 				double r = v;
 				double g = v*v;
 				double b = v*v*v;
@@ -588,12 +595,12 @@ static void ui_handle_SPECTROGRAM(struct ui_ctx* ctx)
 
 		if (frame_index > last_frame_index) {
 			for (int y = 0; y < h; y++) {
-				int bi = ux_map_y_to_fft_bin(ctx, y);
+				int bi = binmap(y, ctx->h, ctx->fft_storage_length, 0.5);
 				double m = 0.0;
 				for (int channel = 0; channel < n_channels; channel++) {
 					m += analysis_get_spectrogram(a, channel, frame_index)[bi];
 				}
-				double v = log(m + 1.0) * 10.0;
+				double v = m*3000.0;
 				double r = v*v;
 				double g = v;
 				double b = v*v*v;
@@ -621,12 +628,12 @@ static void ui_handle_APERIODICITY(struct ui_ctx* ctx)
 
 		if (frame_index > last_frame_index) {
 			for (int y = 0; y < h; y++) {
-				int bi = ux_map_y_to_fft_bin(ctx, y);
+				int bi = binmap(y, ctx->h, ctx->fft_storage_length, 1.0);
 				double m = 0.0;
 				for (int channel = 0; channel < n_channels; channel++) {
 					m += analysis_get_aperiodicity(a, channel, frame_index)[bi];
 				}
-				double v = log(m + 1.0) * 15.0;
+				double v = m;
 				double r = v*v;
 				double g = v*v*v;
 				double b = v;
@@ -767,9 +774,6 @@ int main(int argc, char** argv)
 			p += sizeof h;
 		}
 
-		const int fft_length = get_fft_length_from_sample_rate(sample_rate);
-		const int fft_storage_length = calc_fft_storage_length_from_fft_length(fft_length);
-
 		double* fp = p;
 
 		double* xs = calloc(n_pcm_frames, sizeof *xs);
@@ -778,7 +782,7 @@ int main(int argc, char** argv)
 		double** fft_dst = calloc(n_analysis_frames, sizeof *fft_dst);
 
 		ForwardRealFFT forward_real_fft = {0};
-		InitializeForwardRealFFT(fft_length, &forward_real_fft);
+		InitializeForwardRealFFT(OTHER_SPECTROGRAM_FFT_LENGTH, &forward_real_fft);
 
 		{
 			printf(" ... other spectrogram/DFT (mono)\n");
@@ -786,11 +790,13 @@ int main(int argc, char** argv)
 			const double kb_att = 60.0;
 			const double kb_alpha = kaiser_bessel_attenuation_to_alpha(kb_att);
 
+			const double ch_scale = 1.0 / (double)n_channels;
+
 			for (int i0 = 0; i0 < n_analysis_frames; i0++) {
-				for (int i1 = 0; i1 < fft_length; i1++) {
-					double t = ((double)i1 * 2.0) / (double)(fft_length) - 1.0;
+				for (int i1 = 0; i1 < OTHER_SPECTROGRAM_FFT_LENGTH; i1++) {
+					double t = ((double)i1 * 2.0) / (double)(OTHER_SPECTROGRAM_FFT_LENGTH) - 1.0;
 					double w = kaiser_bessel(kb_alpha, t); // could put this expensive func into a LUT...
-					int xi = (int)round((double)(i0*sample_rate)*ANALYSIS_PERIOD_SECONDS) + i1;
+					int xi = (int)round((double)(i0*sample_rate)*ANALYSIS_PERIOD_SECONDS) + i1 - OTHER_SPECTROGRAM_FFT_LENGTH/2;
 
 					double x = 0.0;
 					if (0 <= xi && xi < n_pcm_frames) {
@@ -798,22 +804,25 @@ int main(int argc, char** argv)
 							x += samples[xi*n_channels + i2];
 						}
 					}
+					x *= ch_scale;
 
 					forward_real_fft.waveform[i1] = x*w;
 				}
 				fft_execute(forward_real_fft.forward_fft);
 
-				for (int i1 = 0; i1 < fft_storage_length; i1++) {
+				for (int i1 = 0; i1 < OTHER_SPECTROGRAM_FFT_STORAGE_LENGTH; i1++) {
 					double re = forward_real_fft.spectrum[i1][0];
 					double im = forward_real_fft.spectrum[i1][1];
 					double mag = sqrt(re*re + im*im);
-					fp[i1] = mag;
+					*(fp++) = mag;
 				}
-				fp += fft_storage_length;
 			}
 		}
 
 		DestroyForwardRealFFT(&forward_real_fft);
+
+		const int fft_length = get_fft_length_from_sample_rate(sample_rate);
+		const int fft_storage_length = calc_fft_storage_length_from_fft_length(fft_length);
 
 		for (int i0 = 0; i0 < n_channels; i0++) {
 			printf(" ... channel %d\n", i0);
