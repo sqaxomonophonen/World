@@ -3,7 +3,10 @@ C99 = gcc -std=c99
 LINK = g++
 AR = ar
 #DEBUG_FLAG=-g
-CXXFLAGS = -O1 -Wall -fPIC $(DEBUG_FLAG)
+CXXFLAGS = -Wall -fPIC $(DEBUG_FLAG)
+CXXFLAGS += -O2
+#CXXFLAGS += -O0 -g
+
 CFLAGS = $(CXXFLAGS)
 ARFLAGS = -rv
 OUT_DIR = ./build
@@ -19,7 +22,7 @@ endif
 CXXFLAGS += $(shell pkg-config --cflags sdl2)
 SDL2LIB += $(shell pkg-config --libs sdl2)
 
-all: default test step0analysis step1edit step2synthesis
+all: default test step0analysis step1edit step2synthesis voxpopfix
 
 ###############################################################################################################
 ### Tests
@@ -29,6 +32,7 @@ test: $(OUT_DIR)/test $(OUT_DIR)/ctest
 step0analysis: $(OUT_DIR)/step0analysis
 step1edit: $(OUT_DIR)/step1edit
 step2synthesis: $(OUT_DIR)/step2synthesis
+voxpopfix: $(OUT_DIR)/voxpopfix
 
 test_OBJS=$(OUT_DIR)/objs/tools/audioio.o $(OUT_DIR)/objs/test/test.o
 $(OUT_DIR)/test: $(OUT_DIR)/libworld.a $(test_OBJS)
@@ -45,6 +49,11 @@ $(OUT_DIR)/step1edit: $(step1edit_OBJS)
 step2synthesis_OBJS=$(OUT_DIR)/objs/tools/audioio.o $(OUT_DIR)/objs/test/step2synthesis.o
 $(OUT_DIR)/step2synthesis: $(OUT_DIR)/libworld.a $(step2synthesis_OBJS)
 	$(LINK) $(CXXFLAGS) -o $(OUT_DIR)/step2synthesis $(step2synthesis_OBJS) $(OUT_DIR)/libworld.a -lm
+
+voxpopfix_OBJS=$(OUT_DIR)/objs/tools/audioio.o $(OUT_DIR)/objs/tools/dr_wav.o $(OUT_DIR)/objs/test/voxpopfix.o
+$(OUT_DIR)/voxpopfix: $(OUT_DIR)/libworld.a $(voxpopfix_OBJS)
+	$(LINK) $(CXXFLAGS) -o $(OUT_DIR)/voxpopfix $(voxpopfix_OBJS) $(OUT_DIR)/libworld.a $(SDL2LIB) -lm
+
 
 
 ctest_OBJS=$(OUT_DIR)/objs/tools/audioio.o $(OUT_DIR)/objs/test/ctest.o
@@ -63,6 +72,8 @@ $(OUT_DIR)/objs/test/step0analysis.o : tools/audioio.h src/world/d4c.h src/world
 $(OUT_DIR)/objs/test/step1edit.o : test/analysis.h
 
 $(OUT_DIR)/objs/test/step2synthesis.o : tools/audioio.h src/world/d4c.h src/world/dio.h src/world/harvest.h src/world/matlabfunctions.h src/world/cheaptrick.h src/world/stonemask.h src/world/synthesis.h src/world/common.h src/world/fft.h src/world/macrodefinitions.h test/analysis.h
+
+$(OUT_DIR)/objs/test/voxpopfix.o : tools/audioio.h src/world/d4c.h src/world/dio.h src/world/harvest.h src/world/matlabfunctions.h src/world/cheaptrick.h src/world/stonemask.h src/world/synthesis.h src/world/common.h src/world/fft.h src/world/macrodefinitions.h
 
 ###############################################################################################################
 ### Library
@@ -99,6 +110,10 @@ $(OUT_DIR)/objs/test/%.o : test/%.cpp
 $(OUT_DIR)/objs/tools/%.o : tools/%.cpp
 	$(call MKDIR,$(OUT_DIR)/objs/tools)
 	$(CXX) $(CXXFLAGS) -Isrc -o "$@" -c "$<"
+
+$(OUT_DIR)/objs/tools/%.o : tools/%.c
+	$(call MKDIR,$(OUT_DIR)/objs/tools)
+	$(C99) $(CFLAGS) -o "$@" -c "$<"
 
 $(OUT_DIR)/objs/world/%.o : src/%.cpp
 	$(call MKDIR,$(OUT_DIR)/objs/world)
