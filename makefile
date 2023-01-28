@@ -4,8 +4,8 @@ LINK = g++
 AR = ar
 #DEBUG_FLAG=-g
 CXXFLAGS = -Wall -fPIC $(DEBUG_FLAG)
-CXXFLAGS += -O2
-#CXXFLAGS += -O0 -g
+#CXXFLAGS += -O2
+CXXFLAGS += -O0 -g
 
 CFLAGS = $(CXXFLAGS)
 ARFLAGS = -rv

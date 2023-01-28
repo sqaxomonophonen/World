@@ -348,6 +348,17 @@ static void edit_open(struct edit* edit, const char* path, struct analysis* anal
 
 	void* p = edit->data;
 	edit->frames = p;
+
+	int n_edits = 0;
+	int last_is_broken = 0;
+	for (int i = 0; i < n; i++) {
+		int is_broken = edit->frames[i].is_broken;
+		if (is_broken && is_broken != last_is_broken) {
+			n_edits++;
+		}
+		last_is_broken = is_broken;
+	}
+	printf("number of edits: %d\n", n_edits);
 }
 
 static void edit_close(struct edit* edit)
