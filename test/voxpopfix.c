@@ -15,6 +15,8 @@
 #include "world/harvest.h"
 #include "world/cheaptrick.h"
 #include "world/d4c.h"
+#include "world/synthesis.h"
+#include "world/synthesisrealtime.h"
 
 #include <SDL.h>
 
@@ -26,6 +28,10 @@
 
 #define OTHER_SPECTROGRAM_FFT_LENGTH (1<<12) // problem most noticable here (lower=too low resolution; higher=too blurry)
 #define OTHER_SPECTROGRAM_FFT_STORAGE_LENGTH (OTHER_SPECTROGRAM_FFT_LENGTH/2+1)
+
+#define BROKEN_WIDTH_SECONDS_F0               (30e-3)
+#define BROKEN_WIDTH_SECONDS_SPECTROGRAM      (16e-3)
+#define BROKEN_WIDTH_SECONDS_APERIODICITY     (10e-3)
 
 static inline double bessel_I0(double x)
 {
@@ -115,32 +121,51 @@ static inline double* analysis_get_other_spectrogram(struct analysis* a, int fra
 	}
 }
 
-static inline double analysis_get_f0(struct analysis* a, int channel, int frame_index)
+static inline double* analysis_get_f0_ptr(struct analysis* a, int channel, int frame_offset)
 {
 	assert(0 <= channel && channel < a->n_channels);
-	if (0 <= frame_index && frame_index < a->n_analysis_frames) {
-		return a->f0[channel][frame_index];
+	if (0 <= frame_offset && frame_offset < a->n_analysis_frames) {
+		return &a->f0[channel][frame_offset];
 	} else {
-		return 0.0;
+		return NULL;
+	}
+}
+
+static inline double analysis_get_f0(struct analysis* a, int channel, int frame_index)
+{
+	double* p = analysis_get_f0_ptr(a, channel, frame_index);
+	return p ? *p : 0.0;
+}
+
+static inline double** analysis_get_spectrogram_ptr(struct analysis* a, int channel, int frame_offset)
+{
+	if (0 <= frame_offset && frame_offset < a->n_analysis_frames) {
+		return &a->spectrogram[channel][frame_offset];
+	} else {
+		return NULL;
 	}
 }
 
 static inline double* analysis_get_spectrogram(struct analysis* a, int channel, int frame_index)
 {
-	if (0 <= frame_index && frame_index < a->n_analysis_frames) {
-		return a->spectrogram[channel][frame_index];
+	double** p = analysis_get_spectrogram_ptr(a, channel, frame_index);
+	return p ? *p : NULL;
+}
+
+static inline double** analysis_get_aperiodicity_ptr(struct analysis* a, int channel, int frame_offset)
+{
+	if (0 <= frame_offset && frame_offset < a->n_analysis_frames) {
+		return &a->aperiodicity[channel][frame_offset];
 	} else {
 		return NULL;
 	}
 }
 
+
 static inline double* analysis_get_aperiodicity(struct analysis* a, int channel, int frame_index)
 {
-	if (0 <= frame_index && frame_index < a->n_analysis_frames) {
-		return a->aperiodicity[channel][frame_index];
-	} else {
-		return NULL;
-	}
+	double** p = analysis_get_aperiodicity_ptr(a, channel, frame_index);
+	return p ? *p : NULL;
 }
 
 static int analysis_open(struct analysis* a, const char* path)
@@ -267,27 +292,12 @@ struct edit_frame {
 	uint32_t is_dry      :1;
 };
 
-struct edit_frame_derived {
-	uint32_t is_f0_broken            :1;
-	uint32_t is_spectrogram_broken   :1;
-	uint32_t is_aperiodicity_broken  :1;
-};
-
 struct edit {
 	int fd;
 	size_t sz;
 	void* data;
 	struct edit_frame* frames;
-	int is_dirty;
-	struct edit_frame_derived* derived_frames;
 };
-
-static void edit_update(struct edit* edit)
-{
-	if (!edit->is_dirty) return;
-	// TODO populate edit->derived_frames
-	edit->is_dirty = 0;
-}
 
 static void edit_open(struct edit* edit, const char* path, struct analysis* analysis)
 {
@@ -331,10 +341,6 @@ static void edit_open(struct edit* edit, const char* path, struct analysis* anal
 
 	void* p = edit->data;
 	edit->frames = p;
-
-	edit->derived_frames = calloc(n, sizeof *edit->derived_frames);
-	edit->is_dirty = 1;
-	edit_update(edit);
 }
 
 static void edit_close(struct edit* edit)
@@ -413,19 +419,15 @@ static inline void ui_nav_apply_d_zoom(struct ui_nav* nav, int mx, double d_zoom
 }
 
 struct ui {
-	#if 0
-	int last_btn;
-	int btn;
-	int mx;
-	int my;
-	int last_mx;
-	int last_my;
-	#endif
-
 	int show[N_UI_ROWS];
-	int last_mx;
-
+	int mouseover_frame_index;
+	int play_position;
+	int painting;
+	int paint_frame_min;
+	int paint_frame_max;
 	struct ui_nav nav;
+	int last_mx;
+	int last_btns;
 };
 
 static void ui_init(struct ui* ui)
@@ -445,6 +447,8 @@ struct ui_ctx {
 	uint32_t* pixels;
 	struct ui_nav* nav;
 	int fft_storage_length;
+	int mouseover_frame_index;
+	int play_position;
 };
 
 static inline int ux_x2f(struct ui_ctx* ctx, int x)
@@ -499,12 +503,60 @@ static inline void ux_plot_additive(struct ui_ctx* ctx, int x, int y, uint32_t p
 	*p = rgba_add(*p, pixel);
 }
 
-static void ui_handle_BROKEN(struct ui_ctx* ctx)
+#define MOUSEOVER (1<<0)
+#define PLAY_POSITION (1<<1)
+
+static inline int ux_frame_index_flags(struct ui_ctx* ctx, int frame_index)
 {
-	ux_fill(ctx, 0x220000ff);
+	int flags = 0;
+	if (frame_index == ctx->mouseover_frame_index) {
+		flags |= MOUSEOVER;
+	}
+	if (frame_index == ctx->play_position) {
+		flags |= PLAY_POSITION;
+	}
+	return flags;
 }
 
-static void ui_handle_DRY(struct ui_ctx* ctx)
+static inline int ux_is_broken_in_width(struct ui_ctx* ctx, int frame_index, double width_seconds)
+{
+	const int df = round((width_seconds / ANALYSIS_PERIOD_SECONDS) / 2.0);
+	const int f0 = frame_index - df;
+	const int f1 = frame_index + df;
+	for (int i = f0; i <= f1; i++) {
+		if (0 <= i && i < ctx->analysis->n_analysis_frames && ctx->edit->frames[i].is_broken) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void ui_render_BROKEN(struct ui_ctx* ctx)
+{
+	ux_fill(ctx, 0x220000ff);
+
+	struct analysis* a = ctx->analysis;
+	struct edit* e = ctx->edit;
+
+	const int n_analysis_frames = a->n_analysis_frames;
+	for (int x = 0; x < ctx->w; x++) {
+		int frame_index = ux_x2f(ctx, x);
+		if (0 <= frame_index && frame_index < n_analysis_frames) {
+			const int is_broken = e->frames[frame_index].is_broken;
+			const int flags = ux_frame_index_flags(ctx, frame_index);
+			uint32_t pixel = 0;
+			if (is_broken) pixel |= 0xff0000ff;
+			if (flags & MOUSEOVER) pixel |= 0x0000ffff;
+			if (flags & PLAY_POSITION) pixel |= 0x222222ff;
+
+			for (int y = 0; y < ctx->h; y++) {
+				ux_plot(ctx, x, y, pixel);
+			}
+		}
+	}
+}
+
+static void ui_render_DRY(struct ui_ctx* ctx)
 {
 	ux_fill(ctx, 0x222222ff);
 }
@@ -527,7 +579,7 @@ static inline uint32_t f64rgbenc(double r, double g, double b)
 		+ 0xff; // alpha
 }
 
-static void ui_handle_OTHER_SPECTROGRAM(struct ui_ctx* ctx)
+static void ui_render_OTHER_SPECTROGRAM(struct ui_ctx* ctx)
 {
 	struct analysis* a = ctx->analysis;
 	const int n_analysis_frames = a->n_analysis_frames;
@@ -552,11 +604,18 @@ static void ui_handle_OTHER_SPECTROGRAM(struct ui_ctx* ctx)
 			last_frame_index = frame_index;
 		}
 
-		for (int y = 0; y < h; y++) ux_plot(ctx, x, y, cached_column[y]);
+		uint32_t mask = 0;
+		const int flags = ux_frame_index_flags(ctx, frame_index);
+		if (flags & MOUSEOVER) mask |= 0x0000ff00;
+		if (flags & PLAY_POSITION) mask |= 0x222222ff;
+		const int is_broken = ux_is_broken_in_width(ctx, frame_index, 0.0);
+		if (is_broken) mask |= 0x7f000000;
+
+		for (int y = 0; y < h; y++) ux_plot(ctx, x, y, cached_column[y] | mask);
 	}
 }
 
-static void ui_handle_F0(struct ui_ctx* ctx)
+static void ui_render_F0(struct ui_ctx* ctx)
 {
 	ux_fill(ctx, 0x111100ff);
 	struct analysis* a = ctx->analysis;
@@ -564,6 +623,9 @@ static void ui_handle_F0(struct ui_ctx* ctx)
 	for (int x = 0; x < ctx->w; x++) {
 		int frame_index = ux_x2f(ctx, x);
 		if (0 <= frame_index && frame_index < n_analysis_frames) {
+			const int flags = ux_frame_index_flags(ctx, frame_index);
+			const int is_broken = ux_is_broken_in_width(ctx, frame_index, BROKEN_WIDTH_SECONDS_F0);
+
 			for (int ch = 0; ch < a->n_channels; ch++) {
 				double f0 = analysis_get_f0(a, ch, frame_index);
 				if (f0 > 0) {
@@ -576,11 +638,21 @@ static void ui_handle_F0(struct ui_ctx* ctx)
 					}
 				}
 			}
+
+			uint32_t add = 0;
+			if (flags & MOUSEOVER) add |= 0x00007f00;
+			if (flags & PLAY_POSITION) add |= 0x222222ff;
+			if (is_broken) add |= 0x7f000000;
+			if (add) {
+				for (int y = 0; y < ctx->h; y++) {
+					ux_plot_additive(ctx, x, y, add);
+				}
+			}
 		}
 	}
 }
 
-static void ui_handle_SPECTROGRAM(struct ui_ctx* ctx)
+static void ui_render_SPECTROGRAM(struct ui_ctx* ctx)
 {
 	struct analysis* a = ctx->analysis;
 	const int n_analysis_frames = a->n_analysis_frames;
@@ -609,11 +681,19 @@ static void ui_handle_SPECTROGRAM(struct ui_ctx* ctx)
 			last_frame_index = frame_index;
 		}
 
-		for (int y = 0; y < h; y++) ux_plot(ctx, x, y, cached_column[y]);
+		uint32_t set = 0;
+		const int flags = ux_frame_index_flags(ctx, frame_index);
+		if (flags & MOUSEOVER) set |= 0x0000ff00;
+		if (flags & PLAY_POSITION) set |= 0x222222ff;
+
+		const int is_broken = ux_is_broken_in_width(ctx, frame_index, BROKEN_WIDTH_SECONDS_SPECTROGRAM);
+		if (is_broken) set |= 0x7f000000;
+
+		for (int y = 0; y < h; y++) ux_plot(ctx, x, y, cached_column[y] | set);
 	}
 }
 
-static void ui_handle_APERIODICITY(struct ui_ctx* ctx)
+static void ui_render_APERIODICITY(struct ui_ctx* ctx)
 {
 	struct analysis* a = ctx->analysis;
 	const int n_analysis_frames = a->n_analysis_frames;
@@ -642,7 +722,15 @@ static void ui_handle_APERIODICITY(struct ui_ctx* ctx)
 			last_frame_index = frame_index;
 		}
 
-		for (int y = 0; y < h; y++) ux_plot(ctx, x, y, cached_column[y]);
+		uint32_t mask = 0xffffffff;
+		const int flags = ux_frame_index_flags(ctx, frame_index);
+		if (flags & MOUSEOVER) mask &= 0x00ffffff;
+		if (flags & PLAY_POSITION) mask &= 0x222222ff;
+
+		const int is_broken = ux_is_broken_in_width(ctx, frame_index, BROKEN_WIDTH_SECONDS_SPECTROGRAM);
+		if (is_broken) mask &= 0xffff00ff;
+
+		for (int y = 0; y < h; y++) ux_plot(ctx, x, y, cached_column[y] & mask);
 	}
 }
 
@@ -669,13 +757,15 @@ static void ui_handle(struct ui* ui, int width, int height, uint32_t* pixels, st
 			.w = width,
 			.nav = &ui->nav,
 			.fft_storage_length = calc_fft_storage_length_from_fft_length(get_fft_length_from_sample_rate(analysis->sample_rate)),
+			.mouseover_frame_index = ui->mouseover_frame_index,
+			.play_position = ui->play_position,
 		};
 		#define ROW(NAME,WEIGHT) \
 			if (ui->show[i]) { \
 				const double dy = (double)height * (WEIGHT / weight_sum); \
 				const double y1 = y0 + dy; \
 				ui_ctx_prep(&ctx, pixels, floor(y0), floor(y1)); \
-				ui_handle_##NAME(&ctx); \
+				ui_render_##NAME(&ctx); \
 				y0 = y1; \
 			} \
 			i++;
@@ -683,21 +773,237 @@ static void ui_handle(struct ui* ui, int width, int height, uint32_t* pixels, st
 		UI_ROWS
 		#undef UI_ROWS
 	}
-
-	#if 0
-	ui->last_btn = ui->btn;
-	ui->last_mx = ui->mx;
-	ui->last_my = ui->my;
-	#endif
 }
 
-static void ui_update_navigation(struct ui* ui, int is_panning, int mx, float d_zoom)
+static void ui_input(struct ui* ui, int mx, int my, int btns, int mod, float d_zoom, int play_position, struct edit* edit)
 {
+	const int is_panning = btns & SDL_BUTTON_RMASK;
 	if (is_panning) ui_nav_apply_pan(&ui->nav, mx - ui->last_mx);
 	if (d_zoom != 0.0) ui_nav_apply_d_zoom(&ui->nav, mx, d_zoom);
+	const int mf = ui_nav_x2f(&ui->nav, mx);
+	ui->mouseover_frame_index = mf;
+
+	ui->play_position = play_position;
+
+	const int no_mod = (mod == 0);
+	const int is_shift = mod & KMOD_SHIFT;
+	//const int is_alt = mod & KMOD_ALT;
+	const int is_ctrl = mod & KMOD_CTRL;
+
+	const int BROKEN = 1;
+	const int ERASE_BROKEN = 2;
+	const int DRY_TOGGLE = 3;
+
+	int bdiff = btns ^ ui->last_btns;
+	if ((btns & SDL_BUTTON_LMASK) && (bdiff & SDL_BUTTON_LMASK)) {
+		if (no_mod) {
+			ui->painting = BROKEN;
+		} else if (is_shift) {
+			ui->painting = ERASE_BROKEN;
+		} else if (is_ctrl) {
+			ui->painting = DRY_TOGGLE;
+		}
+		if (ui->painting) {
+			ui->paint_frame_min = ui->paint_frame_max = mf;
+		}
+	}
+
+	if (ui->painting) {
+		if (btns == 0) {
+			ui->painting = 0;
+		} else {
+			if (mf < ui->paint_frame_min) ui->paint_frame_min = mf;
+			if (mf > ui->paint_frame_max) ui->paint_frame_max = mf;
+			for (int i = ui->paint_frame_min; i <= ui->paint_frame_max; i++) {
+				if (ui->painting == BROKEN) {
+					edit->frames[i].is_broken = 1;
+				} else if (ui->painting == ERASE_BROKEN) {
+					edit->frames[i].is_broken = 0;
+				} else if (ui->painting == DRY_TOGGLE) {
+					// TODO
+				}
+			}
+		}
+	}
+
+	ui->last_btns = btns;
 	ui->last_mx = mx;
 }
 
+#define PLAY_SYNTH (1)
+#define PLAY_DRY   (2)
+
+
+#define ARRAY_LENGTH(xs) (sizeof(xs) / sizeof(xs[0]))
+
+
+struct audio {
+	struct analysis* analysis;
+	int n_channels;
+	int is_playing;
+	int position_frame_index;
+
+	WorldSynthesizer synth[2];
+} audio;
+
+static void audio_callback(void* usr, uint8_t* _data, int n_bytes)
+{
+	const int n_channels = audio.n_channels;
+	const int n = n_bytes / (n_channels * sizeof(float));
+	const int cn = n_channels * n;
+
+	if (audio.is_playing == PLAY_SYNTH) {
+
+		assert(n_channels <= ARRAY_LENGTH(audio.synth));
+
+		int pos[ARRAY_LENGTH(audio.synth)];
+
+		const int n_analysis_frames = audio.analysis->n_analysis_frames;
+
+		for (int ch = 0; ch < n_channels; ch++) {
+			pos[ch] = audio.position_frame_index;
+			WorldSynthesizer* synth = &audio.synth[ch];
+
+			for (;;) {
+				if (IsLocked(synth)) {
+					printf("stopping audio: synth locked?!\n");
+					audio.is_playing = 0;
+					break;
+				}
+
+				int synth_success = Synthesis2(synth);
+				if (synth_success) {
+					float* p = ((float*)_data) + ch;
+					for (int i = 0; i < n; i++) {
+						*p = synth->buffer[i];
+						p += n_channels;
+					}
+					break;
+				}
+
+				int p = pos[ch];
+				if (p >= n_analysis_frames) {
+					printf("stopping audio: reached end\n");
+					audio.is_playing = 0;
+					break;
+				}
+
+				int was_added = AddParameters(
+					analysis_get_f0_ptr(audio.analysis, ch, p),
+					1,
+					analysis_get_spectrogram_ptr(audio.analysis, ch, p),
+					analysis_get_aperiodicity_ptr(audio.analysis, ch, p),
+					synth);
+				if (was_added) {
+					pos[ch]++;
+				} else {
+					printf("stopping audio: ringbuffer full?\n");
+					audio.is_playing = 0;
+					break;
+				}
+			}
+		}
+
+		for (int ch = 1; ch < n_channels; ch++) {
+			if (pos[0] != pos[ch]) {
+				printf("desync %d ?!\n", pos[0]-pos[ch]);
+				#if 0
+				printf("stopping audio: position desync? %d vs %d\n", pos[0], pos[ch]);
+				audio.is_playing = 0;
+				break;
+				#endif
+			}
+		}
+
+		audio.position_frame_index = pos[0];
+	} else if (audio.is_playing == PLAY_DRY) {
+	}
+
+	if (!audio.is_playing) {
+		float* p = (float*)_data;
+		for (int i = 0; i < cn; i++) {
+			*(p++) = 0.0f;
+		}
+	}
+}
+
+static void audio_init(struct analysis* analysis)
+{
+	SDL_AudioSpec want = {
+		.freq = analysis->sample_rate,
+		.format = AUDIO_F32,
+		.channels = analysis->n_channels,
+		.samples = 1<<10,
+		.callback = audio_callback,
+	};
+
+	SDL_AudioSpec have = {0};
+
+	SDL_AudioDeviceID audio_device_id = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+	assert((audio_device_id > 0) && "could not open audio device");
+
+	assert(have.freq == want.freq);
+	assert(have.format == want.format);
+	assert(have.channels == want.channels);
+
+	audio.n_channels = analysis->n_channels;
+	audio.analysis = analysis;
+
+	for (int i = 0; i < ARRAY_LENGTH(audio.synth); i++) {
+		InitializeSynthesizer(
+			analysis->sample_rate,
+			ANALYSIS_PERIOD_SECONDS * 1e3,
+			get_fft_length_from_sample_rate(analysis->sample_rate),
+			have.samples,
+			32, // ringbuffer size
+			&audio.synth[i]);
+	}
+
+	SDL_PauseAudioDevice(audio_device_id, 0);
+}
+
+static int audio_get_play_position()
+{
+	SDL_LockAudio();
+	int pos = -1;
+	if (audio.is_playing) {
+		pos = audio.position_frame_index;
+	}
+	SDL_UnlockAudio();
+	return pos;
+}
+
+static void audio_stop()
+{
+	SDL_LockAudio();
+	audio.is_playing = 0;
+	SDL_UnlockAudio();
+}
+
+static void audio_play(int what, int frame0)
+{
+	SDL_LockAudio();
+
+	audio.is_playing = what;
+	audio.position_frame_index = frame0;
+
+	switch (what) {
+
+	case PLAY_SYNTH: {
+		const int n_channels = audio.analysis->n_channels;
+		for (int i = 0; i < n_channels; i++) {
+			RefreshSynthesizer(&audio.synth[i]);
+		}
+	} break;
+
+	case PLAY_DRY: {
+	} break;
+
+	default: assert(!"unhandled play value");
+	}
+
+	SDL_UnlockAudio();
+}
 
 int main(int argc, char** argv)
 {
@@ -891,6 +1197,10 @@ int main(int argc, char** argv)
 	struct edit edit;
 	edit_open(&edit, path_edit, &analysis);
 
+	SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
+
+	audio_init(&analysis);
+
 	SDL_Window* window;
 	SDL_Renderer* renderer;
 	SDL_CreateWindowAndRenderer(1920, 1080, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI, &window, &renderer);
@@ -907,17 +1217,13 @@ int main(int argc, char** argv)
 	size_t canvas_sz;
 
 	int exiting = 0;
-	int is_panning = 0;
-
-	int mx;
-	int my;
-	SDL_GetMouseState(&mx, &my);
 
 	struct ui ui;
 	ui_init(&ui);
 
 	while (!exiting) {
 		float d_zoom = 0.0f;
+		int play = 0;
 
 		SDL_Event e;
 		while (SDL_PollEvent(&e)) {
@@ -934,26 +1240,18 @@ int main(int argc, char** argv)
 				if (is_down) {
 					if (sym == SDLK_ESCAPE) {
 						exiting = 1;
+					} else if (sym == ' ') {
+						play = PLAY_SYNTH;
+					} else if (sym == 'd') {
+						play = PLAY_DRY;
+					} else if (sym == 'r') {
+						assert(!"TODO render"); // TODO
 					}
 				}
 
 				if (is_down && '1' <= sym && sym < '1'+N_UI_ROWS) {
 					int i = sym-'1';
 					ui.show[i] = !ui.show[i];
-				}
-			} break;
-
-			case SDL_MOUSEMOTION: {
-				mx = e.motion.x;
-				my = e.motion.y;
-			} break;
-
-			case SDL_MOUSEBUTTONDOWN:
-			case SDL_MOUSEBUTTONUP: {
-				const int is_down = (e.type == SDL_MOUSEBUTTONDOWN);
-				const int button = e.button.button;
-				if (button == 3) {
-					is_panning = is_down;
 				}
 			} break;
 
@@ -964,7 +1262,21 @@ int main(int argc, char** argv)
 			}
 		}
 
-		ui_update_navigation(&ui, is_panning, mx, d_zoom);
+		const int play_position = audio_get_play_position();
+		const int is_playing = (play_position >= 0);
+
+		int mx;
+		int my;
+		const int btns = SDL_GetMouseState(&mx, &my);
+		const int mod_state = SDL_GetModState();
+		ui_input(&ui, mx, my, btns, mod_state, d_zoom, play_position, &edit);
+		const int mf = ui.mouseover_frame_index;
+
+		if (is_playing && play) {
+			audio_stop();
+		} else if (play) {
+			audio_play(play, mf);
+		}
 
 		SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
 		SDL_RenderClear(renderer);
