@@ -33,6 +33,8 @@
 #define BROKEN_WIDTH_SECONDS_SPECTROGRAM      (16e-3)
 #define BROKEN_WIDTH_SECONDS_APERIODICITY     (10e-3)
 
+#define DIVRES (1)
+
 static inline double bessel_I0(double x)
 {
 	double d = 0.0;
@@ -1467,7 +1469,7 @@ int main(int argc, char** argv)
 		int my;
 		const int btns = SDL_GetMouseState(&mx, &my);
 		const int mod_state = SDL_GetModState();
-		ui_input(&ui, mx, my, btns, mod_state, d_zoom, play_position, &edit);
+		ui_input(&ui, mx/DIVRES, my/DIVRES, btns, mod_state, d_zoom, play_position, &edit);
 		const int mf = ui.mouseover_frame_index;
 
 		if (is_playing && play) {
@@ -1483,11 +1485,11 @@ int main(int argc, char** argv)
 		int screen_height;
 		SDL_GL_GetDrawableSize(window, &screen_width, &screen_height);
 
-		if (canvas_texture == NULL || canvas_width != screen_width || canvas_height != screen_height) {
+		if (canvas_texture == NULL || canvas_width != screen_width/DIVRES || canvas_height != screen_height/DIVRES) {
 			if (canvas_texture != NULL) SDL_DestroyTexture(canvas_texture);
 			if (canvas_pixels != NULL) free(canvas_pixels);
-			canvas_width = screen_width;
-			canvas_height = screen_height;
+			canvas_width = screen_width/DIVRES;
+			canvas_height = screen_height/DIVRES;
 			canvas_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING, canvas_width, canvas_height);
 			canvas_sz = sizeof(*canvas_pixels) * canvas_width * canvas_height;
 			canvas_pixels = malloc(canvas_sz);
