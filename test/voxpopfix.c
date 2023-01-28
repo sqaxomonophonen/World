@@ -112,6 +112,11 @@ struct analysis {
 	double*** aperiodicity;      // [channel][frame_index][fftbin]
 };
 
+static inline int analysis_get_fft_storage_length(struct analysis* a)
+{
+	return calc_fft_storage_length_from_fft_length(get_fft_length_from_sample_rate(a->sample_rate));
+}
+
 static inline double* analysis_get_other_spectrogram(struct analysis* a, int frame_index)
 {
 	if (0 <= frame_index && frame_index < a->n_analysis_frames) {
@@ -425,6 +430,7 @@ struct ui {
 	int painting;
 	int paint_frame_min;
 	int paint_frame_max;
+	int dry_val;
 	struct ui_nav nav;
 	int last_mx;
 	int last_btns;
@@ -518,17 +524,34 @@ static inline int ux_frame_index_flags(struct ui_ctx* ctx, int frame_index)
 	return flags;
 }
 
-static inline int ux_is_broken_in_width(struct ui_ctx* ctx, int frame_index, double width_seconds)
+static int get_broken_info(struct analysis* a, struct edit* e, int frame_index, double width_seconds, int* out_first_broken, int* out_last_broken)
 {
 	const int df = round((width_seconds / ANALYSIS_PERIOD_SECONDS) / 2.0);
 	const int f0 = frame_index - df;
 	const int f1 = frame_index + df;
 	for (int i = f0; i <= f1; i++) {
-		if (0 <= i && i < ctx->analysis->n_analysis_frames && ctx->edit->frames[i].is_broken) {
+		if (0 <= i && i < a->n_analysis_frames && e->frames[i].is_broken) {
+			if (out_first_broken) {
+				int i = frame_index;
+				while (get_broken_info(a, e, --i, width_seconds, NULL, NULL)) {}
+				i++;
+				*out_first_broken = i;
+			}
+			if (out_last_broken) {
+				int i = frame_index;
+				while (get_broken_info(a, e, ++i, width_seconds, NULL, NULL)) {}
+				i--;
+				*out_last_broken = i;
+			}
 			return 1;
 		}
 	}
 	return 0;
+}
+
+static inline int ux_is_broken_in_width(struct ui_ctx* ctx, int frame_index, double width_seconds)
+{
+	return get_broken_info(ctx->analysis, ctx->edit, frame_index, width_seconds, NULL, NULL);
 }
 
 static void ui_render_BROKEN(struct ui_ctx* ctx)
@@ -537,8 +560,8 @@ static void ui_render_BROKEN(struct ui_ctx* ctx)
 
 	struct analysis* a = ctx->analysis;
 	struct edit* e = ctx->edit;
-
 	const int n_analysis_frames = a->n_analysis_frames;
+
 	for (int x = 0; x < ctx->w; x++) {
 		int frame_index = ux_x2f(ctx, x);
 		if (0 <= frame_index && frame_index < n_analysis_frames) {
@@ -559,6 +582,26 @@ static void ui_render_BROKEN(struct ui_ctx* ctx)
 static void ui_render_DRY(struct ui_ctx* ctx)
 {
 	ux_fill(ctx, 0x222222ff);
+
+	struct analysis* a = ctx->analysis;
+	struct edit* e = ctx->edit;
+	const int n_analysis_frames = a->n_analysis_frames;
+
+	for (int x = 0; x < ctx->w; x++) {
+		int frame_index = ux_x2f(ctx, x);
+		if (0 <= frame_index && frame_index < n_analysis_frames) {
+			const int is_dry = e->frames[frame_index].is_dry;
+			const int flags = ux_frame_index_flags(ctx, frame_index);
+			uint32_t pixel = 0;
+			if (is_dry) pixel |= 0xccccccff;
+			if (flags & MOUSEOVER) pixel |= 0xffffffff;
+			if (flags & PLAY_POSITION) pixel |= 0x222222ff;
+
+			for (int y = 0; y < ctx->h; y++) {
+				ux_plot(ctx, x, y, pixel);
+			}
+		}
+	}
 }
 
 static inline uint32_t f64rgbenc(double r, double g, double b)
@@ -756,7 +799,7 @@ static void ui_handle(struct ui* ui, int width, int height, uint32_t* pixels, st
 			.edit = edit,
 			.w = width,
 			.nav = &ui->nav,
-			.fft_storage_length = calc_fft_storage_length_from_fft_length(get_fft_length_from_sample_rate(analysis->sample_rate)),
+			.fft_storage_length = analysis_get_fft_storage_length(analysis),
 			.mouseover_frame_index = ui->mouseover_frame_index,
 			.play_position = ui->play_position,
 		};
@@ -802,6 +845,7 @@ static void ui_input(struct ui* ui, int mx, int my, int btns, int mod, float d_z
 			ui->painting = ERASE_BROKEN;
 		} else if (is_ctrl) {
 			ui->painting = DRY_TOGGLE;
+			ui->dry_val = !edit->frames[mf].is_dry;
 		}
 		if (ui->painting) {
 			ui->paint_frame_min = ui->paint_frame_max = mf;
@@ -820,7 +864,7 @@ static void ui_input(struct ui* ui, int mx, int my, int btns, int mod, float d_z
 				} else if (ui->painting == ERASE_BROKEN) {
 					edit->frames[i].is_broken = 0;
 				} else if (ui->painting == DRY_TOGGLE) {
-					// TODO
+					edit->frames[i].is_dry = ui->dry_val;
 				}
 			}
 		}
@@ -830,7 +874,88 @@ static void ui_input(struct ui* ui, int mx, int my, int btns, int mod, float d_z
 	ui->last_mx = mx;
 }
 
-#define PLAY_SYNTH (1)
+#define RINGBUF_SZ (1<<6)
+#define RINGBUF_CURSOR_MASK (RINGBUF_SZ-1)
+
+int f0_ringbuf_cursor;
+double f0_ringbuf_storage[RINGBUF_SZ];
+
+
+static inline int ringbuf_cursor_advance(int* cursor)
+{
+	int i = *cursor;
+	*cursor = ((*cursor) + 1) & RINGBUF_CURSOR_MASK;
+	return i;
+}
+
+static double lerp(double a, double b, double u)
+{
+	return a+(b-a)*u;
+}
+
+static double* f0_lerp(double a, double b, double u)
+{
+	double v = lerp(a,b,u);
+	int i = ringbuf_cursor_advance(&f0_ringbuf_cursor);
+	f0_ringbuf_storage[i] = v;
+	return &f0_ringbuf_storage[i];
+}
+
+int fft_ringbuf_cursor;
+double* fft_ringbuf_pointers[RINGBUF_SZ];
+
+static double** fft_lerp(int fft_storage_length, double* fft0, double* fft1, double u)
+{
+	int i = ringbuf_cursor_advance(&fft_ringbuf_cursor);
+	double** pp = &fft_ringbuf_pointers[i];
+	double* p = *pp;
+	for (int i = 0; i < fft_storage_length; i++) {
+		p[i] = lerp(fft0[i], fft1[i], u);
+	}
+	return pp;
+}
+
+static double* get_f0_ptr_edited(struct analysis* a, struct edit* e, int channel, int frame_index)
+{
+	int first_broken, last_broken;
+	if (get_broken_info(a, e, frame_index, BROKEN_WIDTH_SECONDS_F0, &first_broken, &last_broken)) {
+		const int i0 = first_broken-1;
+		const int i1 = last_broken+1;
+		double f0_0 = analysis_get_f0(a, channel, i0);
+		double f0_1 = analysis_get_f0(a, channel, i1);
+		return f0_lerp(f0_0, f0_1, (double)(frame_index-i0) / (double)(i1-i0));
+	}
+	return analysis_get_f0_ptr(a, channel, frame_index);
+}
+
+static double** get_spectrogram_ptr_edited(struct analysis* a, struct edit* e, int channel, int frame_index)
+{
+	int first_broken, last_broken;
+	if (get_broken_info(a, e, frame_index, BROKEN_WIDTH_SECONDS_SPECTROGRAM, &first_broken, &last_broken)) {
+		const int i0 = first_broken-1;
+		const int i1 = last_broken+1;
+		double* spectrogram0 = analysis_get_spectrogram(a, channel, i0);
+		double* spectrogram1 = analysis_get_spectrogram(a, channel, i1);
+		return fft_lerp(analysis_get_fft_storage_length(a), spectrogram0, spectrogram1, (double)(frame_index-i0) / (double)(i1-i0));
+	}
+	return analysis_get_spectrogram_ptr(a, channel, frame_index);
+}
+
+static double** get_aperiodicity_ptr_edited(struct analysis* a, struct edit* e, int channel, int frame_index)
+{
+	int first_broken, last_broken;
+	if (get_broken_info(a, e, frame_index, BROKEN_WIDTH_SECONDS_APERIODICITY, &first_broken, &last_broken)) {
+		const int i0 = first_broken-1;
+		const int i1 = last_broken+1;
+		double* aperiodicity0 = analysis_get_aperiodicity(a, channel, i0);
+		double* aperiodicity1 = analysis_get_aperiodicity(a, channel, i1);
+		return fft_lerp(analysis_get_fft_storage_length(a), aperiodicity0, aperiodicity1, (double)(frame_index-i0) / (double)(i1-i0));
+	}
+	return analysis_get_aperiodicity_ptr(a, channel, frame_index);
+}
+
+
+#define PLAY_EDITED (1)
 #define PLAY_DRY   (2)
 
 
@@ -839,6 +964,7 @@ static void ui_input(struct ui* ui, int mx, int my, int btns, int mod, float d_z
 
 struct audio {
 	struct analysis* analysis;
+	struct edit* edit;
 	int n_channels;
 	int is_playing;
 	int position_frame_index;
@@ -852,7 +978,7 @@ static void audio_callback(void* usr, uint8_t* _data, int n_bytes)
 	const int n = n_bytes / (n_channels * sizeof(float));
 	const int cn = n_channels * n;
 
-	if (audio.is_playing == PLAY_SYNTH) {
+	if (audio.is_playing) {
 
 		assert(n_channels <= ARRAY_LENGTH(audio.synth));
 
@@ -871,6 +997,8 @@ static void audio_callback(void* usr, uint8_t* _data, int n_bytes)
 					break;
 				}
 
+				assert((synth->synthesized_sample % synth->buffer_size) == 0);
+
 				int synth_success = Synthesis2(synth);
 				if (synth_success) {
 					float* p = ((float*)_data) + ch;
@@ -888,11 +1016,26 @@ static void audio_callback(void* usr, uint8_t* _data, int n_bytes)
 					break;
 				}
 
+				double* f0;
+				double** spectrogram;
+				double** aperiodicity;
+				if (audio.is_playing == PLAY_EDITED) {
+					f0 = get_f0_ptr_edited(audio.analysis, audio.edit, ch, p);
+					spectrogram = get_spectrogram_ptr_edited(audio.analysis, audio.edit, ch, p);
+					aperiodicity = get_aperiodicity_ptr_edited(audio.analysis, audio.edit, ch, p);
+				} else if (audio.is_playing == PLAY_DRY) {
+					f0 = analysis_get_f0_ptr(audio.analysis, ch, p);
+					spectrogram = analysis_get_spectrogram_ptr(audio.analysis, ch, p);
+					aperiodicity = analysis_get_aperiodicity_ptr(audio.analysis, ch, p);
+				} else {
+					assert(!"playing what?");
+				}
+
 				int was_added = AddParameters(
-					analysis_get_f0_ptr(audio.analysis, ch, p),
+					f0,
 					1,
-					analysis_get_spectrogram_ptr(audio.analysis, ch, p),
-					analysis_get_aperiodicity_ptr(audio.analysis, ch, p),
+					spectrogram,
+					aperiodicity,
 					synth);
 				if (was_added) {
 					pos[ch]++;
@@ -916,7 +1059,6 @@ static void audio_callback(void* usr, uint8_t* _data, int n_bytes)
 		}
 
 		audio.position_frame_index = pos[0];
-	} else if (audio.is_playing == PLAY_DRY) {
 	}
 
 	if (!audio.is_playing) {
@@ -927,7 +1069,7 @@ static void audio_callback(void* usr, uint8_t* _data, int n_bytes)
 	}
 }
 
-static void audio_init(struct analysis* analysis)
+static void audio_init(struct analysis* analysis, struct edit* edit)
 {
 	SDL_AudioSpec want = {
 		.freq = analysis->sample_rate,
@@ -948,6 +1090,7 @@ static void audio_init(struct analysis* analysis)
 
 	audio.n_channels = analysis->n_channels;
 	audio.analysis = analysis;
+	audio.edit = edit;
 
 	for (int i = 0; i < ARRAY_LENGTH(audio.synth); i++) {
 		InitializeSynthesizer(
@@ -987,22 +1130,19 @@ static void audio_play(int what, int frame0)
 	audio.is_playing = what;
 	audio.position_frame_index = frame0;
 
-	switch (what) {
-
-	case PLAY_SYNTH: {
-		const int n_channels = audio.analysis->n_channels;
-		for (int i = 0; i < n_channels; i++) {
-			RefreshSynthesizer(&audio.synth[i]);
-		}
-	} break;
-
-	case PLAY_DRY: {
-	} break;
-
-	default: assert(!"unhandled play value");
+	const int n_channels = audio.analysis->n_channels;
+	for (int i = 0; i < n_channels; i++) {
+		RefreshSynthesizer(&audio.synth[i]);
 	}
 
 	SDL_UnlockAudio();
+}
+
+static void lerp_init(int fft_size)
+{
+	for (int i = 0; i < RINGBUF_SZ; i++) {
+		fft_ringbuf_pointers[i] = calloc(fft_size, sizeof **fft_ringbuf_pointers);
+	}
 }
 
 int main(int argc, char** argv)
@@ -1197,9 +1337,11 @@ int main(int argc, char** argv)
 	struct edit edit;
 	edit_open(&edit, path_edit, &analysis);
 
+	lerp_init(analysis_get_fft_storage_length(&analysis));
+
 	SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
 
-	audio_init(&analysis);
+	audio_init(&analysis, &edit);
 
 	SDL_Window* window;
 	SDL_Renderer* renderer;
@@ -1241,7 +1383,7 @@ int main(int argc, char** argv)
 					if (sym == SDLK_ESCAPE) {
 						exiting = 1;
 					} else if (sym == ' ') {
-						play = PLAY_SYNTH;
+						play = PLAY_EDITED;
 					} else if (sym == 'd') {
 						play = PLAY_DRY;
 					} else if (sym == 'r') {
