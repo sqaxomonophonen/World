@@ -963,6 +963,7 @@ static double** get_aperiodicity_ptr_edited(struct analysis* a, struct edit* e, 
 
 
 struct audio {
+	SDL_AudioDeviceID device_id;
 	struct analysis* analysis;
 	struct edit* edit;
 	int n_channels;
@@ -972,97 +973,102 @@ struct audio {
 	WorldSynthesizer synth[2];
 } audio;
 
-static void audio_callback(void* usr, uint8_t* _data, int n_bytes)
+
+static void audio_render_next(int n_channels, int n_pcm_frames, float* out)
+{
+	assert(n_channels <= ARRAY_LENGTH(audio.synth));
+
+	int pos[ARRAY_LENGTH(audio.synth)];
+
+	const int n_analysis_frames = audio.analysis->n_analysis_frames;
+
+	for (int ch = 0; ch < n_channels; ch++) {
+		pos[ch] = audio.position_frame_index;
+		WorldSynthesizer* synth = &audio.synth[ch];
+
+		for (;;) {
+			if (IsLocked(synth)) {
+				printf("stopping audio: synth locked?!\n");
+				audio.is_playing = 0;
+				break;
+			}
+
+			assert((synth->synthesized_sample % synth->buffer_size) == 0);
+
+			int synth_success = Synthesis2(synth);
+			if (synth_success) {
+				float* p = out;
+				for (int i = 0; i < n_pcm_frames; i++) {
+					*p = synth->buffer[i];
+					p += n_channels;
+				}
+				break;
+			}
+
+			int p = pos[ch];
+			if (p >= n_analysis_frames) {
+				printf("stopping audio: reached end\n");
+				audio.is_playing = 0;
+				break;
+			}
+
+			double* f0;
+			double** spectrogram;
+			double** aperiodicity;
+			if (audio.is_playing == PLAY_EDITED) {
+				f0 = get_f0_ptr_edited(audio.analysis, audio.edit, ch, p);
+				spectrogram = get_spectrogram_ptr_edited(audio.analysis, audio.edit, ch, p);
+				aperiodicity = get_aperiodicity_ptr_edited(audio.analysis, audio.edit, ch, p);
+			} else if (audio.is_playing == PLAY_DRY) {
+				f0 = analysis_get_f0_ptr(audio.analysis, ch, p);
+				spectrogram = analysis_get_spectrogram_ptr(audio.analysis, ch, p);
+				aperiodicity = analysis_get_aperiodicity_ptr(audio.analysis, ch, p);
+			} else {
+				assert(!"playing what?");
+			}
+
+			int was_added = AddParameters(
+				f0,
+				1,
+				spectrogram,
+				aperiodicity,
+				synth);
+			if (was_added) {
+				pos[ch]++;
+			} else {
+				printf("stopping audio: ringbuffer full?\n");
+				audio.is_playing = 0;
+				break;
+			}
+		}
+	}
+
+	for (int ch = 1; ch < n_channels; ch++) {
+		if (pos[0] != pos[ch]) {
+			printf("desync %d ?!\n", pos[0]-pos[ch]);
+			#if 0
+			printf("stopping audio: position desync? %d vs %d\n", pos[0], pos[ch]);
+			audio.is_playing = 0;
+			break;
+			#endif
+		}
+	}
+
+	audio.position_frame_index = pos[0];
+}
+
+static void audio_callback(void* usr, uint8_t* out, int n_bytes)
 {
 	const int n_channels = audio.n_channels;
 	const int n = n_bytes / (n_channels * sizeof(float));
-	const int cn = n_channels * n;
 
 	if (audio.is_playing) {
-
-		assert(n_channels <= ARRAY_LENGTH(audio.synth));
-
-		int pos[ARRAY_LENGTH(audio.synth)];
-
-		const int n_analysis_frames = audio.analysis->n_analysis_frames;
-
-		for (int ch = 0; ch < n_channels; ch++) {
-			pos[ch] = audio.position_frame_index;
-			WorldSynthesizer* synth = &audio.synth[ch];
-
-			for (;;) {
-				if (IsLocked(synth)) {
-					printf("stopping audio: synth locked?!\n");
-					audio.is_playing = 0;
-					break;
-				}
-
-				assert((synth->synthesized_sample % synth->buffer_size) == 0);
-
-				int synth_success = Synthesis2(synth);
-				if (synth_success) {
-					float* p = ((float*)_data) + ch;
-					for (int i = 0; i < n; i++) {
-						*p = synth->buffer[i];
-						p += n_channels;
-					}
-					break;
-				}
-
-				int p = pos[ch];
-				if (p >= n_analysis_frames) {
-					printf("stopping audio: reached end\n");
-					audio.is_playing = 0;
-					break;
-				}
-
-				double* f0;
-				double** spectrogram;
-				double** aperiodicity;
-				if (audio.is_playing == PLAY_EDITED) {
-					f0 = get_f0_ptr_edited(audio.analysis, audio.edit, ch, p);
-					spectrogram = get_spectrogram_ptr_edited(audio.analysis, audio.edit, ch, p);
-					aperiodicity = get_aperiodicity_ptr_edited(audio.analysis, audio.edit, ch, p);
-				} else if (audio.is_playing == PLAY_DRY) {
-					f0 = analysis_get_f0_ptr(audio.analysis, ch, p);
-					spectrogram = analysis_get_spectrogram_ptr(audio.analysis, ch, p);
-					aperiodicity = analysis_get_aperiodicity_ptr(audio.analysis, ch, p);
-				} else {
-					assert(!"playing what?");
-				}
-
-				int was_added = AddParameters(
-					f0,
-					1,
-					spectrogram,
-					aperiodicity,
-					synth);
-				if (was_added) {
-					pos[ch]++;
-				} else {
-					printf("stopping audio: ringbuffer full?\n");
-					audio.is_playing = 0;
-					break;
-				}
-			}
-		}
-
-		for (int ch = 1; ch < n_channels; ch++) {
-			if (pos[0] != pos[ch]) {
-				printf("desync %d ?!\n", pos[0]-pos[ch]);
-				#if 0
-				printf("stopping audio: position desync? %d vs %d\n", pos[0], pos[ch]);
-				audio.is_playing = 0;
-				break;
-				#endif
-			}
-		}
-
-		audio.position_frame_index = pos[0];
+		audio_render_next(n_channels, n, (float*)out);
 	}
 
 	if (!audio.is_playing) {
-		float* p = (float*)_data;
+		float* p = (float*)out;
+		const int cn = n_channels * n;
 		for (int i = 0; i < cn; i++) {
 			*(p++) = 0.0f;
 		}
@@ -1081,8 +1087,8 @@ static void audio_init(struct analysis* analysis, struct edit* edit)
 
 	SDL_AudioSpec have = {0};
 
-	SDL_AudioDeviceID audio_device_id = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-	assert((audio_device_id > 0) && "could not open audio device");
+	audio.device_id = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+	assert((audio.device_id > 0) && "could not open audio device");
 
 	assert(have.freq == want.freq);
 	assert(have.format == want.format);
@@ -1102,30 +1108,40 @@ static void audio_init(struct analysis* analysis, struct edit* edit)
 			&audio.synth[i]);
 	}
 
-	SDL_PauseAudioDevice(audio_device_id, 0);
+	SDL_PauseAudioDevice(audio.device_id, 0);
+}
+
+static inline void audio_lock()
+{
+	SDL_LockAudioDevice(audio.device_id);
+}
+
+static inline void audio_unlock()
+{
+	SDL_UnlockAudioDevice(audio.device_id);
 }
 
 static int audio_get_play_position()
 {
-	SDL_LockAudio();
+	audio_lock();
 	int pos = -1;
 	if (audio.is_playing) {
 		pos = audio.position_frame_index;
 	}
-	SDL_UnlockAudio();
+	audio_unlock();
 	return pos;
 }
 
 static void audio_stop()
 {
-	SDL_LockAudio();
+	audio_lock();
 	audio.is_playing = 0;
-	SDL_UnlockAudio();
+	audio_unlock();
 }
 
 static void audio_play(int what, int frame0)
 {
-	SDL_LockAudio();
+	audio_lock();
 
 	audio.is_playing = what;
 	audio.position_frame_index = frame0;
@@ -1135,7 +1151,7 @@ static void audio_play(int what, int frame0)
 		RefreshSynthesizer(&audio.synth[i]);
 	}
 
-	SDL_UnlockAudio();
+	audio_unlock();
 }
 
 static void lerp_init(int fft_size)
@@ -1143,6 +1159,46 @@ static void lerp_init(int fft_size)
 	for (int i = 0; i < RINGBUF_SZ; i++) {
 		fft_ringbuf_pointers[i] = calloc(fft_size, sizeof **fft_ringbuf_pointers);
 	}
+}
+
+static void audio_render(const char* path, struct analysis* a, struct edit* e)
+{
+	audio_lock();
+
+	assert((a->n_channels == 1) && "stereo doesn't work...");
+
+	drwav wav = {0};
+	drwav_data_format format = {
+		.container = drwav_container_riff,
+		.format = DR_WAVE_FORMAT_PCM,
+		.channels = a->n_channels,
+		.sampleRate = a->sample_rate,
+		.bitsPerSample = 16,
+	};
+	assert(drwav_init_file_write(&wav, path, &format, NULL));
+
+	const int buffer_size = 1<<10;
+	float* float_buffer = calloc(buffer_size, sizeof *float_buffer);
+	drwav_int16* s16_buffer = calloc(buffer_size, sizeof* s16_buffer);
+
+	const int copy_of_position_frame_index = audio.position_frame_index;
+	const int copy_of_is_playing = audio.is_playing;
+
+	audio.position_frame_index = 0;
+	audio.is_playing = PLAY_EDITED;
+
+	while (audio.is_playing) {
+		audio_render_next(1, buffer_size, float_buffer);
+		drwav_f32_to_s16(s16_buffer, float_buffer, buffer_size);
+		drwav_uint64 n_written = drwav_write_pcm_frames(&wav, buffer_size, s16_buffer);
+	}
+
+	drwav_uninit(&wav);
+
+	audio.is_playing = copy_of_is_playing;
+	audio.position_frame_index = copy_of_position_frame_index;
+
+	audio_unlock();
 }
 
 int main(int argc, char** argv)
@@ -1387,7 +1443,7 @@ int main(int argc, char** argv)
 					} else if (sym == 'd') {
 						play = PLAY_DRY;
 					} else if (sym == 'r') {
-						assert(!"TODO render"); // TODO
+						audio_render(path_render, &analysis, &edit);
 					}
 				}
 

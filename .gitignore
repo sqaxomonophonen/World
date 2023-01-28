@@ -1,9 +1,6 @@
 # generated
 build/
 
-# Test
-*.wav
-
 # Visual Studio
 visualstudio2015/.vs/
 visualstudio2015/Debug/
