@@ -17,7 +17,9 @@ Controls:
 
 Notes / known problems:
  - Really slow software rendering; try changing the `DIVRES` define from 1 to 2 or higher in `test/voxpopfix.c` if you're on a high resolution display.
- - Crashes if you press space in the left out of data bounds region
+ - Crashes if you press space in the left out of data bounds region.
  - The editor is in `test/voxpopfix.c`, the rest is "library code" ("WORLD", SDL2, dr_wav)
  - Requires ~400MB of "analysis data" per minute of audio which is calculated once and stored on disk. It's likely that this could be compressed A LOT given that "WORLD" smells a bit like a voice compression research platform.
  - Besides usage of `mmap()` and friends, and GNU Make, the code ought to build/run on any platform that SDL2/dr_wav.h supports.
+
+What is this software? Casey Muratori had some broken audio over at https://github.com/cmuratori/moriarty_audio and was asking for suggestions on how to fix it. My intuition was to transform the audio into a "smoother domain", so that missing/broken data could be replaced by linear interpolation of nearby "good" data. I went with the domain that "WORLD" provides, which consists of 5ms frames containing f0 (fundamental frequency), spectrogram and aperiodicity data. It also means that the approach struggle a bit with polyphonic signals (e.g. 2+ simultaneous voices).
