@@ -1,7 +1,7 @@
 Building/running (on Linux):
  - Install SDL2 development libraries (`pkg-config --cflags sdl2` must succeed)
  - Build: `make voxpopfix`
- - Run: `./build/voxpopfix mm_left.wav`
+ - Run: `./build/voxpopfix mm_left.wav` (WAV is included)
  - It takes a while to start the first time (see progress by running it in a terminal)
 
 Controls:
