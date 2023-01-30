@@ -1,0 +1,23 @@
+Building/running (on Linux):
+ - Install SDL2 development libraries (`pkg-config --cflags sdl2` must succeed)
+ - Build: `make voxpopfix`
+ - Run: `./build/voxpopfix mm_left.wav`
+ - It takes a while to start the first time (see progress by running it in a terminal)
+
+Controls:
+ - Right click and drag: pan
+ - Mouse wheel: zoom
+ - Left click and drag: paint as broken
+ - Shift + left click and drag: paint as not broken (or "erase broken")
+ - Space: play "edited" audio from mouse cursor
+ - D: play "original" audio from mouse cursor (as if nothing was marked broken, but audio is still synthesized)
+ - R: render to disk
+ - 1-6: toggle row visibility
+ - Escape: quit
+
+Notes / known problems:
+ - Really slow software rendering; try changing the `DIVRES` define from 1 to 2 or higher in `test/voxpopfix.c` if you're on a high resolution display.
+ - Crashes if you press space in the left out of data bounds region
+ - The editor is in `test/voxpopfix.c`, the rest is "library code" ("WORLD", SDL2, dr_wav)
+ - Requires ~400MB of "analysis data" per minute of audio which is calculated once and stored on disk. It's likely that this could be compressed A LOT given that "WORLD" smells a bit like a voice compression research platform.
+ - Besides usage of `mmap()` and friends, and GNU Make, the code ought to build/run on any platform that SDL2/dr_wav.h supports.
